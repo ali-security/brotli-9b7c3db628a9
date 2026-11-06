@@ -431,6 +431,159 @@ func TestDecodeTrailingData(t *testing.T) {
 	}
 }
 
+// writeSingleSymbolPrefixCode writes a simple prefix code (RFC 7932, section
+// 3.4) that contains only symbol, so decoding the symbol takes no bits.
+func writeSingleSymbolPrefixCode(w *bitWriter, alphabetBits uint, symbol uint64) {
+	w.writeBits(2, 1) // HSKIP = 1: simple prefix code
+	w.writeBits(2, 0) // NSYM - 1
+	w.writeBits(alphabetBits, symbol)
+}
+
+// zeroOutputCommandStream returns a stream with a single meta-block of
+// 1<<24 insert-and-copy commands that produce no output: each one refers to
+// static dictionary word 0 of length 4 with transform 34 (OmitFirst4).
+// With a single block type, a meta-block can hold only 1<<24 commands and
+// 1<<24 distances, so decoding the next command needs a block switch.
+// With commandBlockTypes == 2, the first command block is longer than 1<<24,
+// so the distance block switch is reached first.
+func zeroOutputCommandStream(commandBlockTypes int, padding int) []byte {
+	const numCommands = 1 << 24
+	w := &bitWriter{dst: make([]byte, 0, numCommands*14/8+64+padding)}
+	w.writeBits(1, 0)  // WBITS: 16
+	w.writeBits(1, 1)  // ISLAST
+	w.writeBits(1, 0)  // ISLASTEMPTY
+	w.writeBits(2, 0)  // MNIBBLES: 4
+	w.writeBits(16, 0) // MLEN - 1
+	w.writeBits(1, 0)  // NBLTYPESL: 1
+	if commandBlockTypes == 1 {
+		w.writeBits(1, 0) // NBLTYPESI: 1
+	} else {
+		w.writeBits(1, 1)
+		w.writeBits(3, 0)                     // NBLTYPESI: 2
+		writeSingleSymbolPrefixCode(w, 2, 0)  // block type code
+		writeSingleSymbolPrefixCode(w, 5, 25) // block count code: 16625 + 24 bits
+		w.writeBits(24, numCommands+10-16625) // first block count
+	}
+	w.writeBits(1, 0) // NBLTYPESD: 1
+	w.writeBits(2, 0) // NPOSTFIX
+	w.writeBits(4, 0) // NDIRECT
+	w.writeBits(2, 0) // context mode of literal block type 0
+	w.writeBits(1, 0) // NTREESL: 1
+	w.writeBits(1, 0) // NTREESD: 1
+	writeSingleSymbolPrefixCode(w, 8, 'a')
+	for i := 0; i < commandBlockTypes; i++ {
+		// Command 130: no literals, copy length 4, explicit distance.
+		writeSingleSymbolPrefixCode(w, 10, 130)
+	}
+	// Distance code 42: 32765 + 14 extra bits.
+	writeSingleSymbolPrefixCode(w, 6, 42)
+	for i := 0; i < numCommands; i++ {
+		// At position 0, distance 34817 is dictionary reference 34816:
+		// word 0 of length 4 with transform 34, which outputs nothing.
+		w.writeBits(14, 34817-32765)
+	}
+	w.jumpToByteBoundary()
+	return append(w.dst, make([]byte, padding)...)
+}
+
+// longLiteralRunStream returns a stream whose last meta-block holds two
+// insert-and-copy commands with 1<<24 - 3 and 22594 literals. With a single
+// block type, a meta-block can hold only 1<<24 literals, so the fourth literal
+// of the second command needs a block switch. A preceding one-byte
+// uncompressed meta-block keeps the ring buffer from wrapping right before it.
+// With contextMap set, the literals are decoded with two prefix codes selected
+// by the literal context instead of a single one.
+func longLiteralRunStream(contextMap bool, padding int) []byte {
+	w := &bitWriter{}
+	w.writeBits(1, 1) // WBITS: 24
+	w.writeBits(3, 7)
+
+	w.writeBits(1, 0)  // ISLAST
+	w.writeBits(2, 0)  // MNIBBLES: 4
+	w.writeBits(16, 0) // MLEN - 1
+	w.writeBits(1, 1)  // ISUNCOMPRESSED
+	w.jumpToByteBoundary()
+	w.dst = append(w.dst, 'x')
+
+	w.writeBits(1, 1)        // ISLAST
+	w.writeBits(1, 0)        // ISLASTEMPTY
+	w.writeBits(2, 2)        // MNIBBLES: 6
+	w.writeBits(24, 1<<24-1) // MLEN - 1
+	w.writeBits(3, 0)        // NBLTYPESL, NBLTYPESI, NBLTYPESD: 1
+	w.writeBits(2, 0)        // NPOSTFIX
+	w.writeBits(4, 0)        // NDIRECT
+	w.writeBits(2, 0)        // context mode of literal block type 0: LSB6
+	if contextMap {
+		w.writeBits(1, 1)
+		w.writeBits(3, 0) // NTREESL: 2
+		w.writeBits(1, 0) // RLEMAX: 0
+		w.writeBits(2, 1) // HSKIP = 1: simple prefix code
+		w.writeBits(2, 1) // NSYM - 1
+		w.writeBits(1, 0)
+		w.writeBits(1, 1)
+		for i := 0; i < 1<<literalContextBits; i++ {
+			w.writeBits(1, uint64(i&1))
+		}
+		w.writeBits(1, 0) // IMTF
+	} else {
+		w.writeBits(1, 0) // NTREESL: 1
+	}
+	w.writeBits(1, 0) // NTREESD: 1
+	writeSingleSymbolPrefixCode(w, 8, 'a')
+	if contextMap {
+		writeSingleSymbolPrefixCode(w, 8, 'b')
+	}
+	// Command 504: 22594 + 24 extra bits literals, copy length 2, explicit distance.
+	writeSingleSymbolPrefixCode(w, 10, 504)
+	// Distance code 0: the last distance, 4.
+	writeSingleSymbolPrefixCode(w, 6, 0)
+	w.writeBits(24, 1<<24-3-22594)
+	w.writeBits(24, 0)
+	w.jumpToByteBoundary()
+	return append(w.dst, make([]byte, padding)...)
+}
+
+func TestDecodeInvalidBlockSwitch(t *testing.T) {
+	// A category with a single block type has an implicit block length of
+	// 1<<24, and a stream that runs past it is invalid. The decoder must report
+	// this instead of ignoring the failed block switch; for commands that used
+	// to loop forever without consuming input.
+	// The padding keeps enough input available for the fast decoding path.
+	for _, test := range []struct {
+		name   string
+		stream func() []byte
+	}{
+		{"Command", func() []byte { return zeroOutputCommandStream(1, 64) }},
+		{"CommandAtEndOfInput", func() []byte { return zeroOutputCommandStream(1, 0) }},
+		{"Distance", func() []byte { return zeroOutputCommandStream(2, 64) }},
+		{"Literal", func() []byte { return longLiteralRunStream(false, 64) }},
+		{"LiteralAtEndOfInput", func() []byte { return longLiteralRunStream(false, 0) }},
+		{"LiteralContextMap", func() []byte { return longLiteralRunStream(true, 64) }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			stream := test.stream()
+			done := make(chan error, 1)
+			go func() {
+				defer func() {
+					if r := recover(); r != nil {
+						done <- fmt.Errorf("panic: %v", r)
+					}
+				}()
+				_, err := io.Copy(io.Discard, NewReader(bytes.NewReader(stream)))
+				done <- err
+			}()
+			select {
+			case err := <-done:
+				if err == nil || err.Error() != "brotli: BLOCK_SWITCH" {
+					t.Errorf("Decode: got error %v, want brotli: BLOCK_SWITCH", err)
+				}
+			case <-time.After(time.Minute):
+				t.Errorf("Decode did not finish within a minute")
+			}
+		})
+	}
+}
+
 func TestEncodeDecode(t *testing.T) {
 	for _, test := range []struct {
 		data    []byte
