@@ -1,0 +1,101 @@
+name: seal-build
+
+# Upstream github.com/andybalholm/brotli ships no CI configuration at all.
+# This workflow builds the module zip exactly as proxy.golang.org serves it
+# (golang.org/x/mod/zip.CreateFromDir) and runs the project's Go test suite
+# (`go test ./...`) on the go.mod minimum (1.22) and the release-era Go (1.23).
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Optional test name selector (regex alternatives); empty runs the full suite"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  module-zip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23.x"
+          cache: false
+      - name: Build module zip
+        env:
+          GOTOOLCHAIN: local
+        run: |
+          set -euo pipefail
+          HELPER="$RUNNER_TEMP/helper"
+          mkdir -p "$HELPER" "$RUNNER_TEMP/out"
+          cat > "$HELPER/main.go" <<'EOF'
+          package main
+
+          import (
+              "fmt"
+              "os"
+
+              "golang.org/x/mod/module"
+              "golang.org/x/mod/zip"
+          )
+
+          func main() {
+              f, err := os.Create(os.Args[4])
+              if err != nil {
+                  panic(err)
+              }
+              defer f.Close()
+              mv := module.Version{Path: os.Args[1], Version: os.Args[2]}
+              if err := zip.CreateFromDir(f, mv, os.Args[3]); err != nil {
+                  fmt.Fprintln(os.Stderr, err)
+                  os.Exit(1)
+              }
+          }
+          EOF
+          cd "$HELPER"
+          go mod init helper
+          go get golang.org/x/mod@v0.24.0
+          go build -o "$RUNNER_TEMP/mkzip" .
+          # The sealing workflow itself must not ship in the module zip.
+          rm -rf "$GITHUB_WORKSPACE/.github"
+          "$RUNNER_TEMP/mkzip" github.com/andybalholm/brotli v1.2.0 "$GITHUB_WORKSPACE" "$RUNNER_TEMP/out/v1.2.0.zip"
+          unzip -l "$RUNNER_TEMP/out/v1.2.0.zip" | tail -n 3
+      - uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: ${{ runner.temp }}/out/v1.2.0.zip
+          if-no-files-found: error
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ["1.22.x", "1.23.x"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache: false
+      - name: Test
+        env:
+          GOTOOLCHAIN: local
+          TEST_FILTER: ${{ inputs.test-filter }}
+        run: |
+          set -o pipefail
+          go version
+          if [ -n "$TEST_FILTER" ]; then
+            go test -v -count=1 -run "^(${TEST_FILTER})$" ./... 2>&1 | tee test.log
+          else
+            go test -v -count=1 ./... 2>&1 | tee test.log
+          fi
+          status=$?
+          awk '/^[ \t]*--- PASS/{p++} /^[ \t]*--- FAIL/{f++} /^[ \t]*--- SKIP/{s++; print "SKIPPED:", $0} END{printf "TEST SUMMARY: passed=%d failed=%d skipped=%d\n", p, f, s}' test.log
+          exit $status
